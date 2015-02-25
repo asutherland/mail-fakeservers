@@ -434,12 +434,27 @@ imapMailbox.prototype = {
     this.__highestuid = highest;
     return highest;
   },
-  expunge : function () {
+  /**
+   * Expunge deleted messages.  If this is for UID EXPUNGE, messages should be
+   * provided from a call to _parseSequenceSet so that we only consider the
+   * specified messages.
+   */
+  expunge : function (messages) {
     var response = "";
-    for (var i = 0; i < this._messages.length; i++) {
-      if (this._messages[i].flags.indexOf("\\Deleted") >= 0) {
-        response += "* " + (i + 1) + " EXPUNGE\0";
-        this._messages.splice(i--, 1);
+    // We don't have a constrained set, so scan the entire folder.
+    if (!messages) {
+      // Take a snapshot from the list so we don't need to worry about index
+      // number changes as we iterate.  (It's not like this needs to be
+      // efficient, and we already need to do searches for the UID EXPUNGE
+      // case.)
+      messages = this._messages.concat();
+    }
+    for (var i = 0; i < messages.length; i++) {
+      var message = messages[i];
+      if (message.flags.indexOf("\\Deleted") >= 0) {
+        var messageIdx = this._messages.indexOf(message);
+        response += "* " + (messageIdx + 1) + " EXPUNGE\0";
+        this._messages.splice(messageIdx, 1);
       }
     }
     if (response.length > 0)
@@ -696,6 +711,9 @@ function formatArg(argument, spec) {
       argument = argument[0].toUpperCase() + argument.substr(1);
     }
   } else if (spec == "number") {
+    // Note that this passes sequence-sets through intact because parseInt will
+    // stop at a comma and the string coercion on the result by == will find
+    // that parseInt did not cleanly roundtrip the value.
     if (argument == parseInt(argument))
       argument = parseInt(argument);
   } else if (spec == "date") {
@@ -995,8 +1013,11 @@ IMAP_RFC3501_handler.prototype = {
     }
     return response;
   },
-  _treatArgs : function (args, command) {
-    var format = this._argFormat[command];
+  _treatArgs : function (args, command, forceArgFormat) {
+    var format = forceArgFormat || this._argFormat[command];
+    if (!format) {
+      dump("WARNING: no arg format for '" + command + "'!\n");
+    }
     var treatedArgs = [];
     for (var i = 0; i < format.length; i++) {
       var spec = format[i];
@@ -1347,9 +1368,13 @@ IMAP_RFC3501_handler.prototype = {
     this._state = IMAP_STATE_AUTHED;
     return "OK CLOSE completed";
   },
-  EXPUNGE : function (args) {
+  EXPUNGE : function (args, uid) {
     // Will be either empty or LF-terminated already
-    var response = this._selectedMailbox.expunge();
+    var messages = null;
+    if (uid) {
+      messages = this._parseSequenceSet(args[0], true);
+    }
+    var response = this._selectedMailbox.expunge(messages);
     this._daemon.synchronize(this._selectedMailbox);
     return response + "OK EXPUNGE completed";
   },
@@ -2026,8 +2051,8 @@ var IMAP_GMAIL_extension = {
     let regex = /[+-]?FLAGS.*/;
     if (regex.test(args[1])) {
       // if we are storing flags, use the method that was overridden
-      this._argFormat = this._preGMAIL_STORE_argFormat;
-      args = this._treatArgs(args, "STORE");
+      args[0] = "" + args[0]; // _treatArgs wants everything to be a string.
+      args = this._treatArgs(args, "STORE", this._preGMAIL_STORE_argFormat);
       return this._preGMAIL_STORE(args, uid);
     }
     // otherwise, handle gmail specific cases
@@ -2296,11 +2321,10 @@ var IMAP_RFC4315_extension = {
     toBeThis._preRFC4315MOVE = toBeThis.MOVE;
   },
   UID: function (args) {
-    // XXX: UID EXPUNGE is not supported.
     return this._preRFC4315UID(args);
   },
-  APPEND: function (args) {
-    let response = this._preRFC4315APPEND(args);
+  APPEND: function (args, uid) {
+    let response = this._preRFC4315APPEND(args, uid);
     if (response.indexOf("OK") == 0) {
       let mailbox = this._daemon.getMailbox(args[0]);
       let uid = mailbox.uidnext - 1;
@@ -2309,11 +2333,11 @@ var IMAP_RFC4315_extension = {
     }
     return response;
   },
-  COPY: function (args) {
-    let mailbox = this._daemon.getMailbox(args[0]);
+  COPY: function (args, uid) {
+    let mailbox = this._daemon.getMailbox(args[1]);
     if (mailbox)
       var first = mailbox.uidnext;
-    let response = this._preRFC4315COPY(args);
+    let response = this._preRFC4315COPY(args, uid);
     if (response.indexOf("OK") == 0) {
       let last = mailbox.uidnext - 1;
       response = "OK [COPYUID " + this._selectedMailbox.uidvalidity +
@@ -2322,11 +2346,11 @@ var IMAP_RFC4315_extension = {
     }
     return response;
   },
-  MOVE: function (args) {
+  MOVE: function (args, uid) {
     let mailbox = this._daemon.getMailbox(args[1]);
     if (mailbox)
       var first = mailbox.uidnext;
-    let response = this._preRFC4315MOVE(args);
+    let response = this._preRFC4315MOVE(args, uid);
     if (response.indexOf("OK MOVE") != -1) {
       let last = mailbox.uidnext - 1;
       response =
@@ -2337,7 +2361,9 @@ var IMAP_RFC4315_extension = {
     }
     return response;
   },
-  kCapabilities: ["UIDPLUS"]
+  kCapabilities: ["UIDPLUS"],
+  kUidCommands: ["EXPUNGE"],
+  _argFormat: { EXPUNGE: ["[number]"] }
 };
 
 // RFC 5258: LIST-EXTENDED
